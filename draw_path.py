@@ -76,6 +76,7 @@ class DrawPathGUI:
         dynamixel: SyringeBotDynamixel | None = None,
         singularity_threshold: float = 0.07,
         robot_time_scale: float = 2.5,
+        path_smoothing: str = "spline",
     ):
         self.bot = bot or SyringeBot(
             L0=15.0,
@@ -90,6 +91,7 @@ class DrawPathGUI:
         self._singularity_threshold = float(singularity_threshold)
         # >1.0 means robot executes faster than sim replay.
         self._robot_time_scale = max(0.1, float(robot_time_scale))
+        self._path_smoothing = path_smoothing
 
         self._ws_points = self.bot.compute_workspace(n_samples=250)
         self._compute_limits()
@@ -334,7 +336,15 @@ class DrawPathGUI:
         x_lin = np.interp(s, cum, pts[:, 0])
         y_lin = np.interp(s, cum, pts[:, 1])
         linear_path = list(zip(x_lin, y_lin))
-        # Smooth in XY before IK if scipy is present; otherwise keep linear resampling.
+        # Optional XY smoothing mode controlled by CLI flag.
+        if self._path_smoothing == "raw":
+            self._path_linear = linear_path
+            return
+        if self._path_smoothing == "linear":
+            self._path = linear_path
+            self._path_linear = linear_path
+            return
+        # Default: spline smoothing when scipy is present; otherwise keep linear resampling.
         if splprep is not None and splev is not None and len(self._path) >= 4:
             try:
                 # Small positive smoothing removes hand jitter while preserving shape.
@@ -628,6 +638,12 @@ if __name__ == "__main__":
         default=2.5,
         help="Robot speed multiplier vs sim replay duration (>1 faster, <1 slower).",
     )
+    parser.add_argument(
+        "--path-smoothing",
+        choices=("spline", "linear", "raw"),
+        default="spline",
+        help="Path preprocessing after drawing: spline (smooth), linear (straight segments), raw (exact points).",
+    )
     args = parser.parse_args()
 
     dxl = None
@@ -656,4 +672,5 @@ if __name__ == "__main__":
         dynamixel=dxl,
         singularity_threshold=args.singularity_threshold,
         robot_time_scale=args.robot_time_scale,
+        path_smoothing=args.path_smoothing,
     )
