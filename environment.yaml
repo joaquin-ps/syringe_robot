@@ -1,8 +1,12 @@
-name: syringe_robot
+name: syringe_bot
 channels:
   - defaults
   - conda-forge
 dependencies:
-  - python=3.12
+  - python=3.10
   - numpy
   - matplotlib
+  - scipy
+  - pip:
+    - dynamixel-sdk==3.8.4
+    - dynamixel_u2d2 @ git+https://github.com/joaquin-ps/dynamixel_u2d2.git

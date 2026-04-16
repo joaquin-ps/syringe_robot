@@ -110,6 +110,36 @@ class SyringeBot:
                                        self.elbow_sign)
         return JointPositions(A, B, C, D, P)
 
+    def singularity_clearance(self) -> float:
+        """
+        Dimensionless margin in (0, ∞); larger is farther from closure singularity.
+
+        Uses the distance between elbow joints C and D relative to the distal
+        link lengths: near full extension or folded (distal circles nearly
+        tangent), the mechanism loses leverage. Also uses the triangle height
+        *h* of the closure construction (small *h* means near singular).
+
+        Returns ``0.0`` if FK does not close (``P`` is ``None``).
+        """
+        j = self.forward_kinematics()
+        if j.P is None:
+            return 0.0
+        C, D = j.C, j.D
+        d = float(np.linalg.norm(D - C))
+        r1, r2 = float(self.L2), float(self.L4)
+        if d < 1e-12:
+            return 0.0
+        margin_dist = min(d - abs(r1 - r2), (r1 + r2) - d)
+        margin_dist = max(margin_dist, 0.0)
+        a = (r1 * r1 - r2 * r2 + d * d) / (2.0 * d)
+        h = float(np.sqrt(max(r1 * r1 - a * a, 0.0)))
+        scale = max(min(r1, r2), 1e-9)
+        return max(min(margin_dist, h) / scale, 0.0)
+
+    def is_near_singularity(self, threshold: float = 0.07) -> bool:
+        """True if :meth:`singularity_clearance` is below *threshold* (tunable)."""
+        return self.singularity_clearance() < float(threshold)
+
     # ── inverse kinematics ─────────────────────────────────────────────────
 
     def inverse_kinematics(self, px: float, py: float,

@@ -5,13 +5,26 @@ Interactive GUI for the SyringeBot 5-bar parallel manipulator.
 Run:
     conda activate syringe_robot
     python gui.py
+
+With U2D2 hardware (Protocol 2, 4M baud, IDs 11 / 21):
+
+    python gui.py --dynamixel u2d2 --port /dev/ttyUSB0 --baud 4000000
 """
+
+from __future__ import annotations
+
+import argparse
 
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider, TextBox, Button
 
 from syringe_bot import SyringeBot
+
+try:
+    from dynamixel_bridge import SyringeBotDynamixel
+except ImportError:  # optional until env is installed
+    SyringeBotDynamixel = None  # type: ignore[misc, assignment]
 
 
 # ─── Colour palette ──────────────────────────────────────────────────────────
@@ -33,10 +46,30 @@ COLORS = {
 class SyringeBotGUI:
     """Matplotlib-based interactive GUI wrapping a :class:`SyringeBot`."""
 
-    def __init__(self, bot: SyringeBot | None = None):
-        self.bot = bot or SyringeBot()
+    def __init__(
+        self,
+        bot: SyringeBot | None = None,
+        *,
+        dynamixel: SyringeBotDynamixel | None = None,
+        singularity_threshold: float = 0.07,
+    ):
+        self.bot = bot or SyringeBot(
+            L0=15.0,
+            L1=15.0,
+            L2=15.0,
+            L3=15.0,
+            L4=15.0,
+            theta1=0.0,
+            theta2=0.0,
+        )
         self._suppress = False
         self._mode = "joint"  # "joint" or "cartesian"
+        self._dxl = dynamixel
+        self._dxl_status = ""
+        # Dimensionless clearance (see SyringeBot.singularity_clearance); <0 disables blocking.
+        self._singularity_threshold = float(singularity_threshold)
+        self._singularity_msg = ""
+        self._last_safe_theta = (float(self.bot.theta1), float(self.bot.theta2))
 
         self._ws_points: np.ndarray | None = None
         self._xlim: tuple[float, float] = (-15, 15)
@@ -46,6 +79,10 @@ class SyringeBotGUI:
         self._recompute_workspace()
         self._apply_mode()          # disable the inactive group on start
         self._sync_xy_sliders()
+        self.fig.canvas.mpl_connect("close_event", self._on_figure_close)
+        if self._dxl is not None:
+            self._dxl.configure_motors()
+            self._sync_dynamixels()
         self._redraw()
         plt.show()
 
@@ -258,31 +295,174 @@ class SyringeBotGUI:
         self.sl_t2.set_val(np.degrees(self.bot.theta2))
         self._suppress = False
 
+    def _sync_dynamixels(self):
+        """Stream current θ₁, θ₂ to the left/right motors (IDs set on the interface)."""
+        if self._dxl is None:
+            return
+        try:
+            self._dxl.push_joint_angles(self.bot.theta1, self.bot.theta2)
+            self._dxl_status = ""
+        except Exception as exc:
+            self._dxl_status = f"Dynamixel: {exc}"
+
+    def _on_figure_close(self, _event):
+        if self._dxl is not None:
+            try:
+                self._dxl.close()
+            except Exception:
+                pass
+            self._dxl = None
+
+    def _singularity_guard_enabled(self) -> bool:
+        return self._singularity_threshold >= 0.0
+
+    def _guard_apply_joint_angles(self, t1: float, t2: float) -> bool:
+        """Apply θ₁,θ₂ if closure is away from singularity; else revert sliders."""
+        if not self._singularity_guard_enabled():
+            self.bot.theta1, self.bot.theta2 = t1, t2
+            self._last_safe_theta = (t1, t2)
+            self._singularity_msg = ""
+            return True
+        prev = self._last_safe_theta
+        self.bot.theta1, self.bot.theta2 = t1, t2
+        bad = (
+            self.bot.forward_kinematics().P is None
+            or self.bot.is_near_singularity(self._singularity_threshold)
+        )
+        if bad:
+            self.bot.theta1, self.bot.theta2 = prev
+            self._suppress = True
+            self.sl_t1.set_val(np.degrees(self.bot.theta1))
+            self.sl_t2.set_val(np.degrees(self.bot.theta2))
+            self._suppress = False
+            c = self.bot.singularity_clearance()
+            self._singularity_msg = (
+                f"Near singularity (margin={c:.3f}, "
+                f"need ≥{self._singularity_threshold:.3f}) — move blocked"
+            )
+            return False
+        self._last_safe_theta = (t1, t2)
+        self._singularity_msg = ""
+        return True
+
+    def _set_cartesian_sliders(self, px: float, py: float) -> None:
+        """Set XY sliders without triggering callbacks."""
+        self._suppress = True
+        self.sl_x.set_val(float(np.clip(px, self.sl_x.valmin, self.sl_x.valmax)))
+        self.sl_y.set_val(float(np.clip(py, self.sl_y.valmin, self.sl_y.valmax)))
+        self._suppress = False
+
+    def _restore_safe_pose(
+        self,
+        safe_t: tuple[float, float],
+        safe_p: np.ndarray | None,
+        message: str,
+    ) -> None:
+        self.bot.theta1, self.bot.theta2 = safe_t
+        self._last_safe_theta = safe_t
+        self._suppress = True
+        self.sl_t1.set_val(np.degrees(safe_t[0]))
+        self.sl_t2.set_val(np.degrees(safe_t[1]))
+        self._suppress = False
+        if safe_p is not None:
+            self._set_cartesian_sliders(float(safe_p[0]), float(safe_p[1]))
+        self._singularity_msg = message
+
+    def _follow_cartesian_path(self, px: float, py: float) -> bool:
+        """
+        Track the Cartesian slider path incrementally to avoid IK branch jumps.
+
+        If a singular/unreachable point is encountered, clamp at last safe point.
+        """
+        start_p = self.bot.forward_kinematics().P
+        if start_p is None:
+            self._singularity_msg = "Current pose is invalid; cannot move in Cartesian mode"
+            return False
+
+        safe_t = (float(self.bot.theta1), float(self.bot.theta2))
+        safe_p = np.array(start_p, dtype=float)
+        dx, dy = float(px - start_p[0]), float(py - start_p[1])
+        dist = float(np.hypot(dx, dy))
+        n_steps = max(1, min(120, int(np.ceil(dist / 0.08))))
+
+        for i in range(1, n_steps + 1):
+            a = i / n_steps
+            tx = float(start_p[0] + a * dx)
+            ty = float(start_p[1] + a * dy)
+            t1, t2 = self.bot.inverse_kinematics(tx, ty, apply=True)
+            if t1 is None or t2 is None:
+                self._restore_safe_pose(
+                    safe_t,
+                    safe_p,
+                    "Target path left workspace — clamped at last safe point",
+                )
+                return False
+            if self._singularity_guard_enabled() and self.bot.is_near_singularity(
+                self._singularity_threshold
+            ):
+                c = self.bot.singularity_clearance()
+                self._restore_safe_pose(
+                    safe_t,
+                    safe_p,
+                    (
+                        f"Near singularity (margin={c:.3f}, "
+                        f"need ≥{self._singularity_threshold:.3f}) — clamped"
+                    ),
+                )
+                return False
+            safe_t = (float(self.bot.theta1), float(self.bot.theta2))
+            cur_p = self.bot.forward_kinematics().P
+            if cur_p is not None:
+                safe_p = np.array(cur_p, dtype=float)
+
+        self._last_safe_theta = safe_t
+        self._singularity_msg = ""
+        return True
+
     # ── callbacks ──────────────────────────────────────────────────────────
 
     def _on_angle(self, _=None):
         if self._suppress:
             return
-        self.bot.theta1 = np.radians(self.sl_t1.val)
-        self.bot.theta2 = np.radians(self.sl_t2.val)
+        t1, t2 = np.radians(self.sl_t1.val), np.radians(self.sl_t2.val)
+        if not self._guard_apply_joint_angles(t1, t2):
+            self._sync_xy_sliders()
+            self._sync_dynamixels()
+            self._redraw()
+            return
         self._sync_xy_sliders()
+        self._sync_dynamixels()
         self._redraw()
 
     def _on_cartesian(self, _=None):
         if self._suppress:
             return
         px, py = self.sl_x.val, self.sl_y.val
-        t1, t2 = self.bot.inverse_kinematics(px, py, apply=True)
-        if t1 is None or t2 is None:
-            self._set_info("  Target unreachable!  ")
-            self.fig.canvas.draw_idle()
-            return
+        self._follow_cartesian_path(px, py)
         self._sync_angle_sliders()
+        self._sync_dynamixels()
         self._redraw()
 
     def _on_link(self, _=None):
+        prev_L = dict(self.bot.link_lengths)
         self.bot.link_lengths = {k: s.val for k, s in self.sl_L.items()}
         self._recompute_workspace()
+        if self._singularity_guard_enabled() and (
+            self.bot.forward_kinematics().P is None
+            or self.bot.is_near_singularity(self._singularity_threshold)
+        ):
+            self.bot.link_lengths = prev_L
+            self._suppress = True
+            for k, s in self.sl_L.items():
+                s.set_val(prev_L[k])
+            self._suppress = False
+            self._recompute_workspace()
+            self._singularity_msg = (
+                "Link change would reach a singular pose — reverted"
+            )
+            self._redraw()
+            return
+        self._singularity_msg = ""
         self._sync_xy_sliders()
         self._redraw()
 
@@ -294,14 +474,10 @@ class SyringeBotGUI:
             self.fig.canvas.draw_idle()
             return
 
-        t1, t2 = self.bot.inverse_kinematics(px, py, apply=True)
-        if t1 is None or t2 is None:
-            self._set_info("  Target unreachable!  ")
-            self.fig.canvas.draw_idle()
-            return
-
+        self._follow_cartesian_path(px, py)
         self._sync_angle_sliders()
         self._sync_xy_sliders()
+        self._sync_dynamixels()
         self._redraw()
 
     def _on_mode_toggle(self, _=None):
@@ -310,11 +486,25 @@ class SyringeBotGUI:
         self.fig.canvas.draw_idle()
 
     def _on_elbow(self, _=None):
+        prev_sign = self.bot.elbow_sign
         self.bot.toggle_elbow()
         sign_ch = "+" if self.bot.elbow_sign == 1 else "−"
         self.btn_elbow.label.set_text(f"Elbow: {sign_ch}")
         self._recompute_workspace()
+        if self._singularity_guard_enabled() and (
+            self.bot.forward_kinematics().P is None
+            or self.bot.is_near_singularity(self._singularity_threshold)
+        ):
+            self.bot.elbow_sign = prev_sign
+            sign_ch = "+" if self.bot.elbow_sign == 1 else "−"
+            self.btn_elbow.label.set_text(f"Elbow: {sign_ch}")
+            self._recompute_workspace()
+            self._singularity_msg = "Elbow mode would be singular — reverted"
+            self._redraw()
+            return
+        self._singularity_msg = ""
         self._sync_xy_sliders()
+        self._sync_dynamixels()
         self._redraw()
 
     # ── drawing ────────────────────────────────────────────────────────────
@@ -384,11 +574,16 @@ class SyringeBotGUI:
 
         t1d, t2d = self.bot.angles_deg
         sign_ch = "+" if self.bot.elbow_sign == 1 else "−"
-        self._set_info(
+        msg = (
             f"End-Effector  X={P[0]:+.3f}  Y={P[1]:+.3f}\n"
             f"θ₁ = {t1d:+8.2f}°\n"
             f"θ₂ = {t2d:+8.2f}°\n"
             f"Elbow mode: {sign_ch}")
+        if self._dxl_status:
+            msg += f"\n{self._dxl_status}"
+        if self._singularity_msg:
+            msg += f"\n{self._singularity_msg}"
+        self._set_info(msg)
 
     def _draw_invalid(self, ax, A, B, C, D, L):
         ax.plot([A[0], C[0]], [A[1], C[1]], "--",
@@ -405,7 +600,12 @@ class SyringeBotGUI:
         ax.text(0.5, 0.5, "No closure — links cannot reach",
                 transform=ax.transAxes, ha="center", va="center",
                 fontsize=14, color="red", fontweight="bold", alpha=0.7)
-        self._set_info("Configuration impossible\n(distal links cannot close)")
+        msg = "Configuration impossible\n(distal links cannot close)"
+        if self._dxl_status:
+            msg += f"\n{self._dxl_status}"
+        if self._singularity_msg:
+            msg += f"\n{self._singularity_msg}"
+        self._set_info(msg)
 
     def _set_info(self, text):
         self.info.set_text(text)
@@ -413,6 +613,125 @@ class SyringeBotGUI:
 
 # ─── entry point ──────────────────────────────────────────────────────────────
 
+
+def _build_dynamixel_backend(
+    mode: str,
+    port: str,
+    baudrate: int,
+    *,
+    profile_velocity: int,
+    p_gain: int,
+    scale_theta1: float,
+    scale_theta2: float,
+):
+    if SyringeBotDynamixel is None:
+        raise SystemExit(
+            "dynamixel_bridge / dynamixel_u2d2 not installed. "
+            "Install pip deps from environment.yaml."
+        )
+    motor_ids = [11, 21]  # θ₁ left, θ₂ right
+    if mode == "fake":
+        from dynamixel_u2d2 import FakeU2D2Interface
+
+        iface = FakeU2D2Interface(
+            usb_port=port,
+            baudrate=baudrate,
+            motor_ids=motor_ids,
+            protocol_version=2.0,
+        )
+    else:
+        from dynamixel_u2d2 import U2D2Interface
+
+        iface = U2D2Interface(
+            port,
+            baudrate=baudrate,
+            motor_ids=motor_ids,
+            protocol_version=2.0,
+        )
+    return SyringeBotDynamixel(
+        iface,
+        profile_velocity=profile_velocity,
+        position_p_gain=p_gain,
+        scale_theta1=scale_theta1,
+        scale_theta2=scale_theta2,
+    )
+
+
 if __name__ == "__main__":
-    bot = SyringeBot(L0=25.0, L1=15.0, L2=15.0, L3=15.0, L4=15.0)
-    SyringeBotGUI(bot)
+    parser = argparse.ArgumentParser(description="SyringeBot GUI with optional Dynamixel sync.")
+    parser.add_argument(
+        "--dynamixel",
+        choices=("off", "u2d2", "fake"),
+        default="off",
+        help="Stream joint angles to hardware (U2D2) or a fake bus for testing.",
+    )
+    parser.add_argument(
+        "--port",
+        default="/dev/ttyUSB0",
+        help="Serial device for U2D2 (ignored for --dynamixel fake).",
+    )
+    parser.add_argument(
+        "--baud",
+        type=int,
+        default=4_000_000,
+        help="Dynamixel bus baud rate (Protocol 2; use 4000000 for your setup).",
+    )
+    parser.add_argument(
+        "--dxl-profile-velocity",
+        type=int,
+        default=400,
+        help="Profile velocity register (model-specific units; lower = slower moves).",
+    )
+    parser.add_argument(
+        "--dxl-p-gain",
+        type=int,
+        default=800,
+        help="Position P gain after torque is disabled for mode setup.",
+    )
+    parser.add_argument(
+        "--dxl-scale1",
+        type=float,
+        default=1.0,
+        help="Multiply θ₁ (motor 11) before encoder mapping; use -1 if mounted inverted.",
+    )
+    parser.add_argument(
+        "--dxl-scale2",
+        type=float,
+        default=1.0,
+        help="Multiply θ₂ (motor 21) before encoder mapping; use -1 if mounted inverted.",
+    )
+    parser.add_argument(
+        "--singularity-threshold",
+        type=float,
+        default=0.07,
+        help="Block poses when singularity_clearance() falls below this (dimensionless). "
+        "Use a negative value to disable (e.g. -1).",
+    )
+    args = parser.parse_args()
+
+    dxl = None
+    if args.dynamixel != "off":
+        dxl = _build_dynamixel_backend(
+            args.dynamixel,
+            args.port,
+            args.baud,
+            profile_velocity=args.dxl_profile_velocity,
+            p_gain=args.dxl_p_gain,
+            scale_theta1=args.dxl_scale1,
+            scale_theta2=args.dxl_scale2,
+        )
+
+    bot = SyringeBot(
+        L0=15.0,
+        L1=15.0,
+        L2=15.0,
+        L3=15.0,
+        L4=15.0,
+        theta1=np.radians(90.0),
+        theta2=np.radians(90.0),
+    )
+    SyringeBotGUI(
+        bot,
+        dynamixel=dxl,
+        singularity_threshold=args.singularity_threshold,
+    )
