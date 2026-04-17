@@ -110,6 +110,8 @@ class DrawPathGUI:
         self._sim_duration_s = 0.0
         self._sim_started_at_s: float | None = None
         self._status = "Draw a path, then click Play Sim."
+        # Two-step hardware replay: first click moves to start ("Reset Robot"), second runs trajectory.
+        self._robot_armed_for_execute = False
 
         self._build_ui()
         if self._dxl is not None:
@@ -230,6 +232,20 @@ class DrawPathGUI:
         self.btn_clear.on_clicked(self._on_clear)
         self.btn_stop.on_clicked(self._on_stop)
         self.sl_speed.on_changed(self._on_speed)
+        self._sync_robot_play_button()
+
+    def _sync_robot_play_button(self):
+        """Label reflects two-step robot flow after a successful sim."""
+        if self._dxl is None:
+            self.btn_play_robot.label.set_text("Play Robot")
+            return
+        if not self._sim_played_once:
+            self.btn_play_robot.label.set_text("Play Robot")
+            return
+        if self._robot_armed_for_execute:
+            self.btn_play_robot.label.set_text("Play Robot")
+        else:
+            self.btn_play_robot.label.set_text("Reset Robot")
 
     def _set_status(self, text: str):
         self._status = text
@@ -407,6 +423,8 @@ class DrawPathGUI:
             self._anim.event_source.stop()
             self._anim = None
         self._sim_played_once = False
+        self._robot_armed_for_execute = False
+        self._sync_robot_play_button()
         built = self._build_joint_trajectory()
         if built is None:
             self._draw_scene()
@@ -460,7 +478,10 @@ class DrawPathGUI:
                     0.01, time.perf_counter() - self._sim_started_at_s
                 )
             self._sim_started_at_s = None
-            self._set_status("Simulation done. Click Play Robot to execute hardware.")
+            self._set_status(
+                "Simulation done. Click Reset Robot to move to start, then Play Robot to run."
+            )
+            self._sync_robot_play_button()
             self._draw_scene()
 
     def _build_robot_command_stream(self) -> list[tuple[float, float, float, float, float]]:
@@ -512,24 +533,35 @@ class DrawPathGUI:
             self._set_status("No prepared joint trajectory.")
             self._draw_scene()
             return
+        if not self._path_exec:
+            self._set_status("No execution path. Run Play Sim first.")
+            self._draw_scene()
+            return
         if not self._sim_indices:
             self._set_status("No sim pacing data. Run Play Sim first.")
             self._draw_scene()
             return
 
-        first_t1, first_t2 = self._joint_traj[0]
-        self.bot.theta1, self.bot.theta2 = first_t1, first_t2
-        self._trace = [self._path_exec[0]]
-        self._draw_scene()
-        self._set_status("Commanded first point on robot. Confirm in terminal.")
-        self._dxl.push_joint_angles(first_t1, first_t2)
-        self._draw_scene()
-
-        input("Robot moved to first point. Press Enter to execute drawing trajectory...")
+        if not self._robot_armed_for_execute:
+            first_t1, first_t2 = self._joint_traj[0]
+            self.bot.theta1, self.bot.theta2 = first_t1, first_t2
+            self._trace = [self._path_exec[0]]
+            self._dxl.push_joint_angles(first_t1, first_t2)
+            self._robot_armed_for_execute = True
+            self._set_status("Robot at start pose. Click Play Robot again to run trajectory.")
+            self._sync_robot_play_button()
+            self._draw_scene()
+            return
 
         self._set_status("Executing trajectory on robot...")
+        self._robot_armed_for_execute = False
+        self._sync_robot_play_button()
         self._trace = []
         cmd_stream = self._build_robot_command_stream()
+        if not cmd_stream:
+            self._set_status("No robot command stream generated.")
+            self._draw_scene()
+            return
         next_tick = time.perf_counter()
         for i, (t1, t2, px, py, cmd_dt) in enumerate(cmd_stream):
             self.bot.theta1, self.bot.theta2 = t1, t2
@@ -545,7 +577,8 @@ class DrawPathGUI:
             if sleep_s > 0.0:
                 time.sleep(sleep_s)
 
-        self._set_status("Robot trajectory complete.")
+        self._set_status("Robot trajectory complete. Click Reset Robot to go to start again.")
+        self._sync_robot_play_button()
         self._draw_scene()
 
     def _on_stop(self, _=None):
@@ -564,6 +597,8 @@ class DrawPathGUI:
         self._joint_traj = []
         self._path_exec = []
         self._sim_played_once = False
+        self._robot_armed_for_execute = False
+        self._sync_robot_play_button()
         self._set_status("Cleared. Draw a new path.")
         self._draw_scene()
 

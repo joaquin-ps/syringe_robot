@@ -48,7 +48,8 @@ Flow:
 
 1. Draw path with left mouse drag.
 2. Click **Play Sim**.
-3. Click **Play Robot** (robot moves to first point, waits for Enter in terminal, then executes).
+3. After sim, the robot button shows **Reset Robot**: click it once to move the hardware to the trajectory start.
+4. The button then shows **Play Robot**: click again to execute the full drawing on hardware (no terminal prompt).
 
 Path smoothing modes:
 
