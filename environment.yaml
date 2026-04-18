@@ -10,3 +10,4 @@ dependencies:
   - pip:
     - dynamixel-sdk==3.8.4
     - dynamixel_u2d2 @ git+https://github.com/joaquin-ps/dynamixel_u2d2.git
+    - svg.path>=6.3

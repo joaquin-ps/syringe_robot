@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200">
+  <!-- Five-point star as closed path (draw_path.py compatible) -->
+  <path
+    fill="none"
+    stroke="rgb(0%,0%,0%)"
+    stroke-width="2"
+    d="M 100.00 22.00 L 118.81 74.11 L 174.18 75.90 L 130.43 109.89 L 145.85 163.10 L 100.00 132.00 L 54.15 163.10 L 69.57 109.89 L 25.82 75.90 L 81.19 74.11 Z"
+  />
+</svg>

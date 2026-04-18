@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200">
+  <!-- Square as closed path for draw_path.py compatibility -->
+  <path
+    fill="none"
+    stroke="rgb(0%,0%,0%)"
+    stroke-width="2"
+    d="M 60 60 L 140 60 L 140 140 L 60 140 Z"
+  />
+</svg>

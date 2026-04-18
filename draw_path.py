@@ -6,7 +6,13 @@ Draw and replay trajectories for SyringeBot (sim first, robot optional).
 from __future__ import annotations
 
 import argparse
+import re
+import shutil
+import subprocess
+import sys
 import time
+import xml.etree.ElementTree as ET
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -26,6 +32,14 @@ try:
 except ImportError:  # optional if user only wants simulation
     SyringeBotDynamixel = None  # type: ignore[misc, assignment]
 
+try:
+    from svg.path import parse_path
+except Exception:  # pip install svg.path
+    parse_path = None  # type: ignore[misc, assignment]
+
+
+# Horizontal guide in the plot (must match ``ax.axhline`` in ``_draw_scene``).
+SVG_GUIDE_LINE_Y = 17.5
 
 COLORS = {
     "L1": "#5b9bd5",
@@ -68,6 +82,252 @@ def smooth_joint_trajectory(
     return list(zip(t1, t2))
 
 
+def _svg_local_tag(tag: str) -> str:
+    return tag.split("}", 1)[-1] if "}" in tag else tag
+
+
+def _parse_svg_points_attr(raw: str) -> list[tuple[float, float]]:
+    nums = [float(x) for x in re.findall(r"[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?", raw or "")]
+    if len(nums) < 4:
+        return []
+    return list(zip(nums[0::2], nums[1::2]))
+
+
+def _parse_svg_matrix_transform(transform: str | None) -> np.ndarray | None:
+    """Parse first ``matrix(a,b,c,d,e,f)`` in ``transform``; returns 3×3 homogeneous matrix."""
+    if not transform or not transform.strip():
+        return None
+    m = re.search(r"matrix\s*\(\s*([^)]+)\)", transform.strip(), re.I)
+    if not m:
+        return None
+    nums = [float(x) for x in re.findall(r"[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?", m.group(1))]
+    if len(nums) < 6:
+        return None
+    a, b, c, d, e, f = nums[:6]
+    return np.array([[a, c, e], [b, d, f], [0.0, 0.0, 1.0]], dtype=float)
+
+
+def _apply_svg_matrix_points(
+    pts: list[tuple[float, float]], mat: np.ndarray
+) -> list[tuple[float, float]]:
+    out: list[tuple[float, float]] = []
+    for x, y in pts:
+        v = mat @ np.array([x, y, 1.0], dtype=float)
+        out.append((float(v[0]), float(v[1])))
+    return out
+
+
+def _stroke_from_path_element(
+    el: ET.Element, *, segment_point_cap: int = 400
+) -> list[tuple[float, float]]:
+    """Sample ``<path>`` ``d=`` and apply element ``transform`` (``matrix(...)``) if present."""
+    d = el.get("d", "")
+    stroke = _sample_path_d(d, segment_point_cap=segment_point_cap)
+    if len(stroke) < 2:
+        return []
+    M = _parse_svg_matrix_transform(el.get("transform"))
+    if M is not None:
+        stroke = _apply_svg_matrix_points(stroke, M)
+    return stroke
+
+
+def _sample_path_d(d: str, *, segment_point_cap: int = 400) -> list[tuple[float, float]]:
+    if parse_path is None or not (d or "").strip():
+        return []
+    cap = max(8, min(800, int(segment_point_cap)))
+    try:
+        path = parse_path(d.strip())
+    except Exception:
+        return []
+    pts: list[tuple[float, float]] = []
+    for seg in path:
+        try:
+            ell = float(seg.length(error=1e-4))
+        except TypeError:
+            try:
+                ell = float(seg.length())
+            except Exception:
+                ell = 0.0
+        except Exception:
+            ell = 0.0
+        n = max(2, min(cap, int(8 + ell * 0.28)))
+        for i in range(n):
+            t = i / (n - 1) if n > 1 else 0.0
+            z = seg.point(t)
+            pts.append((float(z.real), float(z.imag)))
+    return pts
+
+
+def _join_strokes_with_bridge(
+    strokes: list[list[tuple[float, float]]], bridge_steps: int = 12
+) -> list[tuple[float, float]]:
+    strokes = [s for s in strokes if len(s) >= 2]
+    if not strokes:
+        return []
+    out = list(strokes[0])
+    for stroke in strokes[1:]:
+        a = out[-1]
+        b = stroke[0]
+        for k in range(1, bridge_steps + 1):
+            t = k / (bridge_steps + 1)
+            out.append((a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t))
+        out.extend(stroke[1:])
+    return out
+
+
+def extract_svg_strokes(
+    svg_text: str, *, segment_point_cap: int = 400
+) -> list[list[tuple[float, float]]]:
+    """Polylines in document order: <path d>, <polyline>, <polygon>."""
+    root = ET.fromstring(svg_text)
+    strokes: list[list[tuple[float, float]]] = []
+    for el in root.iter():
+        tag = _svg_local_tag(el.tag)
+        if tag == "path" and el.get("d"):
+            stroke = _stroke_from_path_element(el, segment_point_cap=segment_point_cap)
+            if len(stroke) >= 2:
+                strokes.append(stroke)
+        elif tag in ("polyline", "polygon") and el.get("points"):
+            stroke = _parse_svg_points_attr(el.get("points", ""))
+            if len(stroke) >= 2:
+                M = _parse_svg_matrix_transform(el.get("transform"))
+                if M is not None:
+                    stroke = _apply_svg_matrix_points(stroke, M)
+                if tag == "polygon":
+                    x0, y0 = stroke[0]
+                    x1, y1 = stroke[-1]
+                    if (x0 - x1) ** 2 + (y0 - y1) ** 2 > 1e-12:
+                        stroke = stroke + [stroke[0]]
+                strokes.append(stroke)
+    return strokes
+
+
+def workspace_fit_box(
+    ws: np.ndarray | None,
+    plot_xlim: tuple[float, float],
+    plot_ylim: tuple[float, float],
+    *,
+    shrink: float = 0.04,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Rectangle inside the reachable workspace (clamped to plot limits) for SVG fitting."""
+    if ws is None or len(ws) < 3:
+        return plot_xlim, plot_ylim
+    wx0, wx1 = float(ws[:, 0].min()), float(ws[:, 0].max())
+    wy0, wy1 = float(ws[:, 1].min()), float(ws[:, 1].max())
+    dx = wx1 - wx0
+    dy = wy1 - wy0
+    if dx < 1e-9 or dy < 1e-9:
+        return plot_xlim, plot_ylim
+    mx = shrink * dx
+    my = shrink * dy
+    tx0 = max(plot_xlim[0], wx0 + mx)
+    tx1 = min(plot_xlim[1], wx1 - mx)
+    ty0 = max(plot_ylim[0], wy0 + my)
+    ty1 = min(plot_ylim[1], wy1 - my)
+    if tx1 <= tx0 + 1e-6 or ty1 <= ty0 + 1e-6:
+        return plot_xlim, plot_ylim
+    return (tx0, tx1), (ty0, ty1)
+
+
+def _pick_svg_filepath() -> str | None:
+    """Prefer ``zenity`` on Linux (plays well with Matplotlib); else Tk file dialog."""
+    if sys.platform.startswith("linux") and shutil.which("zenity"):
+        try:
+            r = subprocess.run(
+                ["zenity", "--file-selection", "--title=Select SVG"],
+                capture_output=True,
+                text=True,
+                timeout=300,
+                check=False,
+            )
+            p = (r.stdout or "").strip()
+            if r.returncode == 0 and p:
+                return p
+        except Exception:
+            pass
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:
+        return None
+    root = tk._default_root
+    created = False
+    if root is None:
+        root = tk.Tk()
+        root.withdraw()
+        created = True
+    try:
+        root.lift()
+        try:
+            root.attributes("-topmost", True)
+        except Exception:
+            pass
+        root.update_idletasks()
+        root.update()
+        fp = filedialog.askopenfilename(
+            master=root,
+            title="Select SVG",
+            filetypes=[("SVG", "*.svg"), ("All files", "*")],
+        )
+    finally:
+        if created:
+            root.destroy()
+    return fp if fp else None
+
+
+def fit_stroke_points_to_axes(
+    points: list[tuple[float, float]],
+    xlim: tuple[float, float],
+    ylim: tuple[float, float],
+    *,
+    margin_frac: float = 0.06,
+    anchor: str = "center",
+) -> list[tuple[float, float]]:
+    """Map SVG coordinates (y down) into a target rectangle with uniform scale.
+
+    ``anchor``: ``"center"`` (default), ``"top_left"``, ``"top_right"``, or
+    ``"top_center"`` (centered in ``x``, top-aligned in ``y`` within the target rect).
+    """
+    if len(points) < 2:
+        return []
+    arr = np.asarray(points, dtype=float)
+    arr[:, 1] = -arr[:, 1]
+    mnx, mxx = float(arr[:, 0].min()), float(arr[:, 0].max())
+    mny, mxy = float(arr[:, 1].min()), float(arr[:, 1].max())
+    dx = mxx - mnx or 1.0
+    dy = mxy - mny or 1.0
+    xw = xlim[1] - xlim[0]
+    yh = ylim[1] - ylim[0]
+    scale = (1.0 - 2.0 * margin_frac) * min(xw / dx, yh / dy)
+    cx = 0.5 * (mnx + mxx)
+    cy = 0.5 * (mny + mxy)
+    tcx = 0.5 * (xlim[0] + xlim[1])
+    tcy = 0.5 * (ylim[0] + ylim[1])
+    xs0 = (arr[:, 0] - cx) * scale
+    ys0 = (arr[:, 1] - cy) * scale
+    px_min = float(xs0.min())
+    px_max = float(xs0.max())
+    py_min = float(ys0.min())
+    py_max = float(ys0.max())
+    mx = margin_frac * xw
+    my = margin_frac * yh
+    if anchor == "top_left":
+        ox = (xlim[0] + mx) - px_min
+        oy = (ylim[1] - my) - py_max
+    elif anchor == "top_right":
+        ox = (xlim[1] - mx) - px_max
+        oy = (ylim[1] - my) - py_max
+    elif anchor == "top_center":
+        ox = tcx - 0.5 * (px_min + px_max)
+        oy = (ylim[1] - my) - py_max
+    else:
+        ox = tcx - 0.5 * (px_min + px_max)
+        oy = tcy - 0.5 * (py_min + py_max)
+    xs = xs0 + ox
+    ys = ys0 + oy
+    return [(float(xs[i]), float(ys[i])) for i in range(len(xs))]
+
+
 class DrawPathGUI:
     def __init__(
         self,
@@ -77,6 +337,10 @@ class DrawPathGUI:
         singularity_threshold: float = 0.07,
         robot_time_scale: float = 2.5,
         path_smoothing: str = "spline",
+        initial_svg: str | None = None,
+        svg_resample_spacing: float = 0.024,
+        svg_sim_frame_cap: int = 4000,
+        svg_segment_point_cap: int = 400,
     ):
         self.bot = bot or SyringeBot(
             L0=15.0,
@@ -92,6 +356,9 @@ class DrawPathGUI:
         # >1.0 means robot executes faster than sim replay.
         self._robot_time_scale = max(0.1, float(robot_time_scale))
         self._path_smoothing = path_smoothing
+        self._svg_resample_spacing = float(np.clip(svg_resample_spacing, 1e-4, 5.0))
+        self._svg_sim_frame_cap = int(np.clip(svg_sim_frame_cap, 50, 20_000))
+        self._svg_segment_point_cap = int(np.clip(svg_segment_point_cap, 8, 800))
 
         self._ws_points = self.bot.compute_workspace(n_samples=250)
         self._compute_limits()
@@ -99,7 +366,7 @@ class DrawPathGUI:
         self._path: list[tuple[float, float]] = []
         self._path_linear: list[tuple[float, float]] = []
         self._trace: list[tuple[float, float]] = []
-        self._speed = 2.0
+        self._speed = 20.0
         self._drawing = False
         self._anim: FuncAnimation | None = None
         self._sim_played_once = False
@@ -112,11 +379,17 @@ class DrawPathGUI:
         self._status = "Draw a path, then click Play Sim."
         # Two-step hardware replay: first click moves to start ("Reset Robot"), second runs trajectory.
         self._robot_armed_for_execute = False
+        self._path_is_svg_loaded = False
 
         self._build_ui()
         if self._dxl is not None:
             self._dxl.configure_motors()
             self._status = "Robot connected. Please run Play Sim before Play Robot."
+        if initial_svg:
+            try:
+                self._load_svg_from_file(initial_svg)
+            except Exception as e:
+                self._set_status(f"--svg failed: {e}")
         self._draw_scene()
         plt.show()
 
@@ -158,7 +431,7 @@ class DrawPathGUI:
         bh = 0.055           # button height
         gap = 0.018          # gap between buttons
         # Stack from top to bottom, vertically centred around 0.5.
-        n_items = 5          # 4 buttons + 1 slider
+        n_items = 6          # 5 buttons + 1 slider
         block_h = n_items * bh + (n_items - 1) * gap
         top = 0.5 + block_h / 2
 
@@ -192,8 +465,17 @@ class DrawPathGUI:
         self.btn_clear.label.set_fontweight("bold")
         self.btn_clear.label.set_color("white")
 
-        self.btn_stop = Button(
+        self.btn_load_svg = Button(
             self.fig.add_axes([rx, _btn_y(3), rw, bh]),
+            "Load SVG",
+            color="#8d6e63",
+            hovercolor="#bcaaa4",
+        )
+        self.btn_load_svg.label.set_fontweight("bold")
+        self.btn_load_svg.label.set_color("white")
+
+        self.btn_stop = Button(
+            self.fig.add_axes([rx, _btn_y(4), rw, bh]),
             "Stop",
             color="#7986cb",
             hovercolor="#9fa8da",
@@ -201,13 +483,13 @@ class DrawPathGUI:
         self.btn_stop.label.set_fontweight("bold")
         self.btn_stop.label.set_color("white")
 
-        sl_y = _btn_y(4) + bh * 0.25
+        sl_y = _btn_y(5) + bh * 0.25
         self.sl_speed = Slider(
             self.fig.add_axes([rx, sl_y, rw, bh * 0.5]),
             "Speed",
             0.2,
-            20.0,
-            valinit=2.0,
+            50.0,
+            valinit=20.0,
             valstep=0.1,
             color=COLORS["L4"],
         )
@@ -230,6 +512,7 @@ class DrawPathGUI:
         self.btn_play_sim.on_clicked(self._on_play_sim)
         self.btn_play_robot.on_clicked(self._on_play_robot)
         self.btn_clear.on_clicked(self._on_clear)
+        self.btn_load_svg.on_clicked(self._on_load_svg)
         self.btn_stop.on_clicked(self._on_stop)
         self.sl_speed.on_changed(self._on_speed)
         self._sync_robot_play_button()
@@ -247,6 +530,69 @@ class DrawPathGUI:
         else:
             self.btn_play_robot.label.set_text("Reset Robot")
 
+    def _load_svg_from_file(self, filepath: str) -> None:
+        if parse_path is None:
+            raise RuntimeError("Install svg.path (pip install svg.path, or conda env from environment.yaml).")
+        p = Path(filepath).expanduser()
+        if not p.is_file():
+            raise RuntimeError(f"Not a file: {p}")
+        svg_text = p.read_text(encoding="utf-8", errors="replace")
+        strokes = extract_svg_strokes(
+            svg_text, segment_point_cap=self._svg_segment_point_cap
+        )
+        if not strokes:
+            raise RuntimeError("No usable <path d>, <polyline>, or <polygon> in SVG.")
+        joined = _join_strokes_with_bridge(strokes)
+        fit_xlim, fit_ylim = workspace_fit_box(self._ws_points, self._xlim, self._ylim)
+        # Keep SVG entirely above the dashed guide line; place in the upper-left corner of that band.
+        gap = 0.15
+        y_lo, y_hi = fit_ylim
+        y_lo = max(y_lo, SVG_GUIDE_LINE_Y + gap)
+        if y_hi <= y_lo + 1e-6:
+            y_lo = SVG_GUIDE_LINE_Y + gap
+        fit_ylim = (y_lo, y_hi)
+        fitted = fit_stroke_points_to_axes(
+            joined,
+            fit_xlim,
+            fit_ylim,
+            margin_frac=0.05,
+            anchor="top_center",
+        )
+        if len(fitted) < 2:
+            raise RuntimeError("SVG produced too few points after fitting to axes.")
+        self._path = fitted
+        self._path_is_svg_loaded = True
+        self._path_linear = []
+        self._trace = []
+        self._joint_traj = []
+        self._path_exec = []
+        self._sim_played_once = False
+        self._robot_armed_for_execute = False
+        self._sync_robot_play_button()
+        self._resample_path()
+        self._set_status(f"Loaded SVG ({len(self._path)} pts). Click Play Sim.")
+
+    def _on_load_svg(self, _=None):
+        if self._anim is not None:
+            self._set_status("Stop simulation before loading SVG.")
+            self._draw_scene()
+            return
+        if parse_path is None:
+            self._set_status("Install svg.path (see environment.yaml).")
+            self._draw_scene()
+            return
+        fp = _pick_svg_filepath()
+        if not fp:
+            self._set_status("SVG load cancelled (or no file dialog). Try: draw_path.py --svg file.svg")
+            self._draw_scene()
+            return
+        try:
+            self._load_svg_from_file(fp)
+        except Exception as e:
+            self._set_status(f"SVG load failed: {e}")
+        self.fig.canvas.flush_events()
+        self._draw_scene()
+
     def _set_status(self, text: str):
         self._status = text
         self.info.set_text(text)
@@ -256,7 +602,14 @@ class DrawPathGUI:
         ax.cla()
         ax.set_aspect("equal")
         ax.grid(True, alpha=0.2, linewidth=0.5)
-        ax.axhline(17.5, color="#666666", linewidth=1.0, alpha=0.25, linestyle="--", zorder=0)
+        ax.axhline(
+            SVG_GUIDE_LINE_Y,
+            color="#666666",
+            linewidth=1.0,
+            alpha=0.25,
+            linestyle="--",
+            zorder=0,
+        )
         ax.set_xlabel("X", fontsize=10)
         ax.set_ylabel("Y", fontsize=10)
         ax.set_title("Draw path (left drag) → Play Sim → Play Robot", fontsize=12, fontweight="bold")
@@ -313,6 +666,7 @@ class DrawPathGUI:
         if event.xdata is None or event.ydata is None:
             return
         self._drawing = True
+        self._path_is_svg_loaded = False
         self._path = [(float(event.xdata), float(event.ydata))]
         self._trace = []
         self._joint_traj = []
@@ -337,9 +691,11 @@ class DrawPathGUI:
         self._set_status("Path captured. Click Play Sim.")
         self._draw_scene()
 
-    def _resample_path(self, spacing: float = 0.08):
+    def _resample_path(self, spacing: float | None = None):
         if len(self._path) < 2:
             return
+        if spacing is None:
+            spacing = self._svg_resample_spacing if self._path_is_svg_loaded else 0.08
         pts = np.array(self._path, dtype=float)
         diffs = np.diff(pts, axis=0)
         dists = np.hypot(diffs[:, 0], diffs[:, 1])
@@ -354,6 +710,11 @@ class DrawPathGUI:
         linear_path = list(zip(x_lin, y_lin))
         # Optional XY smoothing mode controlled by CLI flag.
         if self._path_smoothing == "raw":
+            self._path_linear = [(float(pts[i, 0]), float(pts[i, 1])) for i in range(len(pts))]
+            return
+        # Imported SVG: skip XY spline so Play Sim follows the outline; keep dense polyline.
+        if self._path_is_svg_loaded:
+            self._path = linear_path
             self._path_linear = linear_path
             return
         if self._path_smoothing == "linear":
@@ -441,7 +802,12 @@ class DrawPathGUI:
         n = len(self._joint_traj)
         speed = max(self._speed, 0.1)
         # Higher speed should shorten preview (fewer rendered frames).
-        target_frames = max(20, int(700 / speed))
+        # SVG / long paths: many more frames so the red trace follows the geometry accurately.
+        if self._path_is_svg_loaded:
+            cap = self._svg_sim_frame_cap
+            target_frames = min(n, cap, max(320, int(3600 / speed)))
+        else:
+            target_frames = max(20, int(700 / speed))
         step = max(1, int(np.ceil(n / target_frames)))
         self._sim_indices = list(range(0, n, step))
         if not self._sim_indices:
@@ -593,6 +959,8 @@ class DrawPathGUI:
             self._anim.event_source.stop()
             self._anim = None
         self._path = []
+        self._path_is_svg_loaded = False
+        self._path_linear = []
         self._trace = []
         self._joint_traj = []
         self._path_exec = []
@@ -670,7 +1038,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--robot-time-scale",
         type=float,
-        default=2.5,
+        default=6.0,
         help="Robot speed multiplier vs sim replay duration (>1 faster, <1 slower).",
     )
     parser.add_argument(
@@ -678,6 +1046,34 @@ if __name__ == "__main__":
         choices=("spline", "linear", "raw"),
         default="spline",
         help="Path preprocessing after drawing: spline (smooth), linear (straight segments), raw (exact points).",
+    )
+    parser.add_argument(
+        "--svg",
+        type=str,
+        default=None,
+        metavar="FILE.svg",
+        help="Load path geometry from an SVG file at startup (<path>, <polyline>, <polygon>).",
+    )
+    parser.add_argument(
+        "--svg-resample-spacing",
+        type=float,
+        default=0.20,
+        metavar="DX",
+        help="After SVG load: arc-length spacing along path (larger = fewer IK points). Typical 0.02–0.15.",
+    )
+    parser.add_argument(
+        "--svg-sim-frame-cap",
+        type=int,
+        default=4000,
+        metavar="N",
+        help="Max Play Sim animation frames for SVG (lower = coarser preview, faster).",
+    )
+    parser.add_argument(
+        "--svg-segment-point-cap",
+        type=int,
+        default=400,
+        metavar="K",
+        help="Max samples per SVG <path> segment when parsing curves (lower = fewer raw points).",
     )
     args = parser.parse_args()
 
@@ -708,4 +1104,8 @@ if __name__ == "__main__":
         singularity_threshold=args.singularity_threshold,
         robot_time_scale=args.robot_time_scale,
         path_smoothing=args.path_smoothing,
+        initial_svg=args.svg,
+        svg_resample_spacing=args.svg_resample_spacing,
+        svg_sim_frame_cap=args.svg_sim_frame_cap,
+        svg_segment_point_cap=args.svg_segment_point_cap,
     )

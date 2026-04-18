@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200">
+  <!-- Symmetric heart as closed cubic path (draw_path.py compatible) -->
+  <path
+    fill="none"
+    stroke="rgb(0%,0%,0%)"
+    stroke-width="2"
+    d="M 100 170 C 100 170 38 128 30 88 C 24 52 52 28 100 60 C 148 28 176 52 170 88 C 162 128 100 170 100 170 Z"
+  />
+</svg>

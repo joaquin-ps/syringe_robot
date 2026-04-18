@@ -1,7 +1,7 @@
 """
 Map SyringeBot joint angles to Dynamixel goal positions and drive two motors via U2D2.
 
-Encoder value 2048 is treated as 0 rad in the GUI frame. One revolution = 4096 ticks.
+Encoder value 1024 is treated as 0 rad in the GUI frame. One revolution = 4096 ticks.
 """
 
 from __future__ import annotations
@@ -13,12 +13,12 @@ import numpy as np
 if TYPE_CHECKING:
     from dynamixel_u2d2.base_interface import BaseInterface
 
-ENCODER_CENTER = 1024 # keep it as 1024, it is correct
+ENCODER_CENTER = 1024
 TICKS_PER_REV = 4096
 
 
 def joint_radians_to_encoder(theta: float, scale: float = 1.0) -> int:
-    """Convert joint angle (rad) to raw Dynamixel position; 2048 ↔0 rad."""
+    """Convert joint angle (rad) to raw Dynamixel position; 1024 ↔ 0 rad."""
     t = float(scale) * float(theta)
     raw = ENCODER_CENTER + (t / (2.0 * np.pi)) * TICKS_PER_REV
     return int(round(raw)) % TICKS_PER_REV
